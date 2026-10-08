@@ -394,6 +394,413 @@ def _density_for_circle(
     return float(np.clip(0.45 * binary_density + 0.20 * darkness + 0.20 * fixed_density + 0.15 * contrast, 0.0, 1.0))
 
 
+
+def _robust_empty_baseline(
+    all_density_rows: Sequence[Sequence[float]],
+) -> tuple[float, float]:
+    """
+    Learn the normal empty-bubble level from the CURRENT sheet.
+
+    Most bubbles on a normal answer sheet are empty, so the lower
+    part of the global score distribution is a strong empty reference.
+    """
+    flat: list[float] = []
+
+    for row in all_density_rows:
+        for value in row:
+            try:
+                flat.append(float(value))
+            except Exception:
+                pass
+
+    if not flat:
+        return 0.020, 0.010
+
+    arr = np.asarray(flat, dtype=np.float32)
+
+    cutoff = float(np.percentile(arr, 60))
+    empties = arr[arr <= cutoff]
+
+    if empties.size < max(6, int(arr.size * 0.25)):
+        empties = arr
+
+    median = float(np.median(empties))
+    mad = float(np.median(np.abs(empties - median)))
+    sigma = max(0.006, 1.4826 * mad)
+
+    return median, sigma
+
+
+def _smart_row_classification(
+    densities: Sequence[float],
+    *,
+    answer_key_mode: bool,
+    choices: Sequence[str],
+    sheet_empty: float | None = None,
+    sheet_sigma: float | None = None,
+) -> tuple[str | None, str, float]:
+    """
+    Robust row + sheet OMR classifier.
+
+    Handles:
+      - blank rows
+      - one light but obvious mark
+      - one strong + faint erasure/smudge
+      - two close selected bubbles
+      - two unequal marks where one clearly wins
+      - 3+ selected bubbles
+      - all choices selected
+      - raised empty-bubble scores caused by print/lighting
+      - different pen/pencil darkness
+
+    API stays unchanged:
+        selected, status, confidence
+    """
+    values = np.asarray(densities, dtype=np.float32)
+
+    if values.size < 2 or not np.all(np.isfinite(values)):
+        return None, "unclear", 0.0
+
+    n = len(values)
+    order = np.argsort(values)[::-1]
+
+    top_idx = int(order[0])
+    second_idx = int(order[1])
+
+    top = float(values[top_idx])
+    second = float(values[second_idx])
+    third = float(values[int(order[2])]) if n >= 3 else 0.0
+
+    # ------------------------------------------------------------
+    # Local empty reference.
+    #
+    # Use the lowest ~25% of this row, not half of the row.
+    # This is important when 3 of 4 bubbles are intentionally marked.
+    # ------------------------------------------------------------
+    local_count = max(1, int(np.floor(n * 0.25)))
+    local_low = np.sort(values)[:local_count]
+    row_empty = float(np.median(local_low))
+
+    if sheet_empty is None:
+        sheet_empty = row_empty
+    if sheet_sigma is None:
+        sheet_sigma = 0.010
+
+    sheet_empty = float(sheet_empty)
+    noise = max(0.008, float(sheet_sigma))
+
+    # Local contrast is best for deciding which bubbles in THIS row are
+    # marked. Sheet contrast helps recognize "all choices selected".
+    local_contrasts = values - row_empty
+    sheet_contrasts = values - sheet_empty
+
+    top_local = max(0.0, float(local_contrasts[top_idx]))
+    second_local = max(0.0, float(local_contrasts[second_idx]))
+
+    gap12 = max(0.0, top - second)
+    gap23 = max(0.0, second - third)
+
+    ratio12 = top / max(second, 0.010)
+    relative_gap12 = gap12 / max(top, 0.010)
+
+    row_min = float(np.min(values))
+    row_max = float(np.max(values))
+    row_spread = row_max - row_min
+
+    # ------------------------------------------------------------
+    # Special case: ALL / almost all bubbles are strongly elevated.
+    #
+    # When there is no low bubble inside the row, local contrast alone
+    # cannot tell that everything was selected. Compare the entire row
+    # to the sheet-wide empty baseline.
+    # ------------------------------------------------------------
+    uniformly_elevated = (
+        row_min >= max(0.055, sheet_empty + max(0.040, 3.0 * noise))
+        and row_spread <= 0.055
+    )
+
+    if uniformly_elevated:
+        return None, "multiple", 90.0
+
+    # ------------------------------------------------------------
+    # Candidate and strong mark thresholds.
+    # ------------------------------------------------------------
+    candidate_local_floor = max(0.022, 1.8 * noise)
+    strong_local_floor = max(0.036, 2.8 * noise)
+
+    candidate_mask = (
+        (values >= 0.040)
+        & (local_contrasts >= candidate_local_floor)
+    )
+
+    strong_mask = (
+        (values >= 0.055)
+        & (local_contrasts >= strong_local_floor)
+    )
+
+    candidate_indices = np.where(candidate_mask)[0].tolist()
+    strong_indices = np.where(strong_mask)[0].tolist()
+
+    candidate_count = len(candidate_indices)
+    strong_count = len(strong_indices)
+
+    # ------------------------------------------------------------
+    # BLANK
+    #
+    # Weak + flat + no candidate = blank.
+    # A Q7-like [0,0,0.063,0] survives because its local contrast is large.
+    # ------------------------------------------------------------
+    top_small = top < max(
+        0.055 if not answer_key_mode else 0.060,
+        sheet_empty + 2.0 * noise,
+    )
+
+    no_relative_winner = (
+        top_local < max(0.022, 1.8 * noise)
+        and gap12 < 0.018
+    )
+
+    if top_small and no_relative_winner and candidate_count == 0:
+        return None, "blank", 0.0
+
+    # ------------------------------------------------------------
+    # 3+ strong selections => Multiple.
+    # ------------------------------------------------------------
+    if strong_count >= 3:
+        confidence = float(
+            np.clip(
+                70.0 + 120.0 * max(0.0, float(np.mean(values[strong_mask])) - row_empty),
+                70.0,
+                99.0,
+            )
+        )
+        return None, "multiple", confidence
+
+    # ------------------------------------------------------------
+    # Exactly 2 strong selections.
+    #
+    # If close -> Multiple.
+    # If clearly unequal -> strongest wins.
+    # ------------------------------------------------------------
+    if strong_count == 2:
+        sidx = sorted(
+            strong_indices,
+            key=lambda i: float(values[i]),
+            reverse=True,
+        )
+
+        s1 = float(values[sidx[0]])
+        s2 = float(values[sidx[1]])
+
+        pair_gap = s1 - s2
+        pair_ratio = s1 / max(s2, 0.010)
+        pair_relative_gap = pair_gap / max(s1, 0.010)
+
+        close_pair = (
+            pair_gap <= 0.040
+            or pair_relative_gap <= 0.24
+            or pair_ratio <= 1.32
+        )
+
+        other_indices = [
+            i for i in range(n)
+            if i not in strong_indices
+        ]
+
+        other_max = (
+            float(np.max(values[other_indices]))
+            if other_indices
+            else row_empty
+        )
+
+        pair_separation = min(s1, s2) - other_max
+
+        if (
+            close_pair
+            and pair_separation >= max(0.018, 1.6 * noise)
+        ):
+            closeness = 1.0 - np.clip(
+                pair_relative_gap / 0.24,
+                0.0,
+                1.0,
+            )
+
+            separation = np.clip(
+                pair_separation / 0.12,
+                0.0,
+                1.0,
+            )
+
+            confidence = float(
+                np.clip(
+                    (
+                        0.60 * closeness
+                        + 0.40 * separation
+                    )
+                    * 100.0,
+                    60.0,
+                    99.0,
+                )
+            )
+
+            return None, "multiple", confidence
+
+        # Two visible marks, but one clearly dominates.
+        confidence = float(
+            np.clip(
+                55.0
+                + 150.0 * pair_gap
+                + 25.0 * min(1.0, top_local / 0.12),
+                55.0,
+                99.0,
+            )
+        )
+
+        return str(choices[top_idx]), "clear", confidence
+
+    # ------------------------------------------------------------
+    # One strong selection.
+    #
+    # Normally pick it. Only call Multiple if a second lighter candidate
+    # is genuinely close and clearly above the remaining choices.
+    # ------------------------------------------------------------
+    if strong_count == 1:
+        if candidate_count >= 2:
+            second_candidate_real = (
+                second >= 0.045
+                and second_local >= max(0.026, 2.0 * noise)
+            )
+
+            close_second = (
+                gap12 <= 0.025
+                or relative_gap12 <= 0.18
+                or ratio12 <= 1.22
+            )
+
+            second_separated_from_third = (
+                n < 3
+                or gap23 >= 0.018
+                or second >= third * 1.25
+            )
+
+            if (
+                second_candidate_real
+                and close_second
+                and second_separated_from_third
+            ):
+                return None, "multiple", 60.0
+
+        confidence = float(
+            np.clip(
+                55.0
+                + 220.0 * top_local
+                + 90.0 * gap12,
+                55.0,
+                99.0,
+            )
+        )
+
+        return str(choices[top_idx]), "clear", confidence
+
+    # ------------------------------------------------------------
+    # No strong marks, but light-pencil candidates exist.
+    # ------------------------------------------------------------
+    if candidate_count >= 3:
+        candidate_values = values[candidate_mask]
+
+        if float(np.mean(candidate_values) - row_empty) >= max(
+            0.026,
+            2.0 * noise,
+        ):
+            return None, "multiple", 60.0
+
+    if candidate_count == 2:
+        cidx = sorted(
+            candidate_indices,
+            key=lambda i: float(values[i]),
+            reverse=True,
+        )
+
+        c1 = float(values[cidx[0]])
+        c2 = float(values[cidx[1]])
+
+        cgap = c1 - c2
+        cratio = c1 / max(c2, 0.010)
+        crel = cgap / max(c1, 0.010)
+
+        close_candidates = (
+            cgap <= 0.025
+            or crel <= 0.20
+            or cratio <= 1.25
+        )
+
+        other_indices = [
+            i for i in range(n)
+            if i not in candidate_indices
+        ]
+
+        other_max = (
+            float(np.max(values[other_indices]))
+            if other_indices
+            else row_empty
+        )
+
+        pair_sep = min(c1, c2) - other_max
+
+        if (
+            close_candidates
+            and pair_sep >= max(0.016, 1.5 * noise)
+        ):
+            return None, "multiple", 58.0
+
+        return str(choices[top_idx]), "clear", 50.0
+
+    # ------------------------------------------------------------
+    # One light but obvious relative winner.
+    # ------------------------------------------------------------
+    winner_dominates = (
+        top_local >= max(0.022, 1.8 * noise)
+        and (
+            gap12 >= 0.020
+            or ratio12 >= 1.35
+            or relative_gap12 >= 0.26
+        )
+    )
+
+    if winner_dominates:
+        gap_score = np.clip(gap12 / 0.12, 0.0, 1.0)
+        ratio_score = np.clip((ratio12 - 1.0) / 1.7, 0.0, 1.0)
+        contrast_score = np.clip(top_local / 0.11, 0.0, 1.0)
+
+        confidence = float(
+            (
+                0.35 * gap_score
+                + 0.25 * ratio_score
+                + 0.40 * contrast_score
+            )
+            * 100.0
+        )
+
+        return str(choices[top_idx]), "clear", max(
+            confidence,
+            55.0,
+        )
+
+    # ------------------------------------------------------------
+    # Strange / uniformly ambiguous row.
+    #
+    # If at least two bubbles still stand above the local empty reference
+    # but there is no clear winner, Multiple is safer than forcing one.
+    # ------------------------------------------------------------
+    elevated_mask = local_contrasts >= max(0.022, 1.8 * noise)
+    elevated_count = int(np.sum(elevated_mask))
+
+    if elevated_count >= 2:
+        return None, "multiple", 55.0
+
+    return None, "blank", 0.0
+
+
 def classify_densities(
     densities: Sequence[float],
     *,
@@ -401,278 +808,13 @@ def classify_densities(
     choices: Sequence[str] = CHOICES,
 ) -> tuple[str | None, str, float]:
     """
-    Whole-row dominance logic.
-
-    Decision philosophy:
-      1. If the row is genuinely empty -> blank.
-      2. Rank all choices from strongest to weakest.
-      3. If the top TWO bubbles both contain strong ink,
-         are close to one another, and both clearly stand
-         above the remaining choices -> multiple.
-      4. Otherwise the strongest bubble wins.
-
-    This is intended to catch cases such as:
-        A = 0.08
-        B = 0.30
-        C = 0.09
-        D = 0.28
-    as MULTIPLE, while still selecting one answer when:
-        A = 0.08
-        B = 0.31
-        C = 0.09
-        D = 0.17
-    because B clearly dominates.
+    Backwards-compatible row-only classifier.
     """
-    values = np.asarray(densities, dtype=np.float32)
-
-    if len(values) < 2:
-        return None, "unclear", 0.0
-
-    # --------------------------------------------------
-    # Rank strongest -> weakest
-    # --------------------------------------------------
-    order = np.argsort(values)[::-1]
-
-    top_index = int(order[0])
-    second_index = int(order[1])
-
-    top = float(values[top_index])
-    second = float(values[second_index])
-
-    if len(values) >= 3:
-        third = float(values[int(order[2])])
-    else:
-        third = 0.0
-
-    # --------------------------------------------------
-    # Row statistics
-    # --------------------------------------------------
-    top_second_gap = max(0.0, top - second)
-    second_third_gap = max(0.0, second - third)
-
-    top_second_ratio = top / max(second, 0.020)
-    relative_top_gap = top_second_gap / max(top, 0.020)
-
-    # Median of the lower-scoring choices gives us a
-    # local "normal empty bubble" reference for this row.
-    if len(values) >= 3:
-        lower_values = values[order[2:]]
-        row_background = float(np.median(lower_values))
-    else:
-        row_background = min(top, second)
-
-    # --------------------------------------------------
-    # BLANK CHECK
-    # --------------------------------------------------
-    # Keep a conservative blank floor so printed outlines,
-    # shadows, and tiny camera noise do not create an answer.
-    blank_threshold = 0.075 if answer_key_mode else 0.065
-
-    if top < blank_threshold:
-        return None, "blank", 0.0
-
-    # --------------------------------------------------
-    # Is each of the top two really ink?
-    # --------------------------------------------------
-    filled_floor = 0.095 if answer_key_mode else 0.085
-
-    top_is_filled = (
-        top >= filled_floor
-        and top >= row_background + 0.025
+    return _smart_row_classification(
+        densities,
+        answer_key_mode=answer_key_mode,
+        choices=choices,
     )
-
-    second_is_filled = (
-        second >= filled_floor
-        and second >= row_background + 0.025
-    )
-
-    # --------------------------------------------------
-    # Are the strongest two close enough to represent
-    # two intentional marks?
-    # --------------------------------------------------
-    top_two_are_close = (
-        top_second_gap <= 0.045
-        or relative_top_gap <= 0.22
-        or top_second_ratio <= 1.28
-    )
-
-    # --------------------------------------------------
-    # Does the second mark stand out from all the rest?
-    #
-    # This is important. Two values can be "close" simply
-    # because every bubble is weak. We only want Multiple
-    # when the second bubble also looks like real ink.
-    # --------------------------------------------------
-    second_stands_out = (
-        second_third_gap >= 0.030
-        or second >= third * 1.25
-        or second >= row_background + 0.045
-    )
-
-    # Extra whole-row comparison:
-    # both top marks should be significantly stronger than
-    # the average of the remaining choices.
-    if len(values) >= 3:
-        rest_mean = float(np.mean(values[order[2:]]))
-    else:
-        rest_mean = 0.0
-
-    top_pair_dominates_rest = (
-        top >= rest_mean + 0.040
-        and second >= rest_mean + 0.035
-    )
-
-    # --------------------------------------------------
-    # MULTIPLE
-    # --------------------------------------------------
-    if (
-        top_is_filled
-        and second_is_filled
-        and top_two_are_close
-        and second_stands_out
-        and top_pair_dominates_rest
-    ):
-        # A high confidence here means we are confident that
-        # there are multiple real marks, not that one answer wins.
-        closeness = 1.0 - np.clip(relative_top_gap / 0.22, 0.0, 1.0)
-        separation = np.clip((second - rest_mean) / 0.18, 0.0, 1.0)
-
-        confidence = float(
-            np.clip(
-                (0.60 * closeness + 0.40 * separation) * 100.0,
-                55.0,
-                99.0,
-            )
-        )
-
-        return None, "multiple", confidence
-
-    # --------------------------------------------------
-    # OTHERWISE THE STRONGEST BUBBLE WINS
-    # --------------------------------------------------
-    answer = str(choices[top_index])
-
-    # Confidence is based on how strongly the winner beats
-    # the runner-up and the rest of the row.
-    gap_score = np.clip(top_second_gap / 0.15, 0.0, 1.0)
-
-    relative_score = np.clip(
-        relative_top_gap / 0.50,
-        0.0,
-        1.0,
-    )
-
-    ratio_score = np.clip(
-        (top_second_ratio - 1.0) / 1.50,
-        0.0,
-        1.0,
-    )
-
-    rest_separation = np.clip(
-        (top - rest_mean) / 0.20,
-        0.0,
-        1.0,
-    )
-
-    confidence = float(
-        (
-            0.35 * gap_score
-            + 0.25 * relative_score
-            + 0.15 * ratio_score
-            + 0.25 * rest_separation
-        )
-        * 100.0
-    )
-
-    # If the winner is genuinely above the row's background,
-    # don't show an unnecessarily tiny confidence number.
-    if top_is_filled:
-        confidence = max(confidence, 40.0)
-
-    return answer, "clear", confidence
-
-def _robust_empty_baseline(all_density_rows: Sequence[Sequence[float]]) -> tuple[float, float]:
-    """
-    Estimate the sheet's typical empty-bubble level from the lower portion of
-    observed bubble densities. Returns (median_empty, robust_sigma).
-    """
-    flat = []
-    for row in all_density_rows:
-        for v in row:
-            try:
-                flat.append(float(v))
-            except Exception:
-                pass
-    if not flat:
-        return 0.05, 0.02
-
-    arr = np.asarray(flat, dtype=np.float32)
-    # Use lower 55% as probable empty-bubble population.
-    cutoff = np.percentile(arr, 55)
-    empties = arr[arr <= cutoff]
-    if empties.size < 6:
-        empties = arr
-
-    med = float(np.median(empties))
-    mad = float(np.median(np.abs(empties - med)))
-    sigma = max(0.008, 1.4826 * mad)
-    return med, sigma
-
-
-def _mark_texture_features(gray: np.ndarray, cx: int, cy: int, radius: int) -> dict:
-    """
-    Inspect the bubble interior for:
-      - darkness
-      - texture / patchiness
-      - strong diagonal strokes that can indicate a cross-out
-    """
-    h, w = gray.shape[:2]
-    r = max(4, int(radius * 0.72))
-    x0, x1 = max(0, cx-r), min(w, cx+r+1)
-    y0, y1 = max(0, cy-r), min(h, cy+r+1)
-    roi = gray[y0:y1, x0:x1]
-    if roi.size == 0:
-        return {"patchiness": 0.0, "diag_strength": 0.0, "center_dark": 0.0}
-
-    # circular mask
-    yy, xx = np.ogrid[:roi.shape[0], :roi.shape[1]]
-    mx, my = (roi.shape[1]-1)/2.0, (roi.shape[0]-1)/2.0
-    rr = min(roi.shape[:2]) * 0.45
-    mask = (xx-mx)**2 + (yy-my)**2 <= rr**2
-    vals = roi[mask].astype(np.float32)
-    if vals.size == 0:
-        return {"patchiness": 0.0, "diag_strength": 0.0, "center_dark": 0.0}
-
-    center_dark = float(np.mean((255.0 - vals) / 255.0))
-    patchiness = float(np.std(vals) / 128.0)
-    patchiness = float(np.clip(patchiness, 0.0, 1.0))
-
-    # Hough lines in bubble interior for crossed-out marks
-    edges = cv2.Canny(roi, 60, 150)
-    lines = cv2.HoughLinesP(
-        edges, 1, np.pi/180, threshold=max(6, int(radius*0.45)),
-        minLineLength=max(6, int(radius*0.75)),
-        maxLineGap=max(2, int(radius*0.18))
-    )
-    diag = 0.0
-    if lines is not None:
-        for ln in lines[:, 0, :]:
-            x1l, y1l, x2l, y2l = map(float, ln)
-            dx = x2l-x1l
-            dy = y2l-y1l
-            length = math.hypot(dx, dy)
-            if length <= 0:
-                continue
-            angle = abs(math.degrees(math.atan2(dy, dx))) % 180.0
-            # diagonal-ish line, not horizontal/vertical printed ring fragments
-            if 20 <= angle <= 70 or 110 <= angle <= 160:
-                diag = max(diag, min(1.0, length / max(1.0, radius*1.7)))
-
-    return {
-        "patchiness": patchiness,
-        "diag_strength": float(diag),
-        "center_dark": center_dark,
-    }
 
 
 def classify_densities_adaptive(
@@ -684,53 +826,15 @@ def classify_densities_adaptive(
     choices: Sequence[str] = CHOICES,
 ) -> tuple[str | None, str, float]:
     """
-    Sheet-adaptive version of classify_densities.
-
-    A true answer must rise above the current sheet's empty-bubble population.
-    Once it does, dominance decides the winner; only close top-two marks are
-    considered multiple.
+    Preferred classifier used by scan_sheet().
     """
-    values = np.asarray(densities, dtype=np.float32)
-    if len(values) < 2:
-        return None, "unclear", 0.0
-
-    order = np.argsort(values)[::-1]
-    top_index = int(order[0])
-    second_index = int(order[1])
-
-    top = float(values[top_index])
-    second = float(values[second_index])
-    gap = max(0.0, top - second)
-    ratio = top / max(second, 0.020)
-    relative_gap = gap / max(top, 0.020)
-
-    # Dynamic blank cutoff based on actual sheet noise + conservative floor.
-    floor = 0.070 if answer_key_mode else 0.060
-    adaptive_blank = max(floor, empty_baseline + 2.8 * empty_sigma)
-    if top < adaptive_blank:
-        return None, "blank", 0.0
-
-    second_has_ink = second >= max(
-        0.080 if not answer_key_mode else 0.090,
-        empty_baseline + 2.2 * empty_sigma,
+    return _smart_row_classification(
+        densities,
+        answer_key_mode=answer_key_mode,
+        choices=choices,
+        sheet_empty=empty_baseline,
+        sheet_sigma=empty_sigma,
     )
-
-    very_close = (
-        gap <= (0.030 if answer_key_mode else 0.027)
-        or relative_gap <= 0.18
-        or ratio <= 1.20
-    )
-
-    if second_has_ink and very_close:
-        separation = np.clip(relative_gap / 0.18, 0.0, 1.0)
-        return None, "multiple", float(separation * 45.0)
-
-    abs_score = np.clip(gap / 0.14, 0.0, 1.0)
-    rel_score = np.clip((relative_gap - 0.18) / 0.52, 0.0, 1.0)
-    ratio_score = np.clip((ratio - 1.20) / 1.20, 0.0, 1.0)
-    confidence = float((0.45 * abs_score + 0.35 * rel_score + 0.20 * ratio_score) * 100.0)
-    confidence = max(confidence, 35.0)
-    return str(choices[top_index]), "clear", confidence
 
 def _blur_score(image_bgr: np.ndarray) -> float:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -779,14 +883,32 @@ def scan_sheet(
         grid_warning = "Bubble-grid refinement was not confident enough, so grading used the marker-aligned template positions."
         warning = (warning + " " + grid_warning) if warning else grid_warning
 
+    # Two-pass answer analysis:
+    # 1) measure all bubbles
+    # 2) learn this sheet's empty-bubble baseline
+    # 3) classify each row using local + sheet-wide context
+    measured_rows: list[tuple[float, ...]] = []
+
+    for row in rows_to_use:
+        densities = tuple(
+            _density_for_circle(gray, threshold, center)
+            for center in row
+        )
+        measured_rows.append(densities)
+
+    sheet_empty, sheet_sigma = _robust_empty_baseline(measured_rows)
+
     detections: list[QuestionDetection] = []
-    for q_index, row in enumerate(rows_to_use, start=1):
-        densities = tuple(_density_for_circle(gray, threshold, center) for center in row)
-        selected, status, confidence = classify_densities(
+
+    for q_index, densities in enumerate(measured_rows, start=1):
+        selected, status, confidence = classify_densities_adaptive(
             densities,
+            empty_baseline=sheet_empty,
+            empty_sigma=sheet_sigma,
             answer_key_mode=answer_key_mode,
             choices=choices,
         )
+
         detections.append(
             QuestionDetection(
                 question=q_index,
