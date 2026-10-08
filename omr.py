@@ -401,78 +401,195 @@ def classify_densities(
     choices: Sequence[str] = CHOICES,
 ) -> tuple[str | None, str, float]:
     """
-    Dominance-first decision logic.
+    Whole-row dominance logic.
 
-    The scanner no longer returns "unclear" simply because a mark is weaker than
-    an old absolute threshold. Once a row is not blank, the strongest two
-    choices are compared mathematically.
+    Decision philosophy:
+      1. If the row is genuinely empty -> blank.
+      2. Rank all choices from strongest to weakest.
+      3. If the top TWO bubbles both contain strong ink,
+         are close to one another, and both clearly stand
+         above the remaining choices -> multiple.
+      4. Otherwise the strongest bubble wins.
 
-    Decision:
-      * truly empty row -> blank
-      * top two marks genuinely close -> multiple
-      * otherwise -> choose the dominant (strongest) bubble
-
-    This is intentionally based on BOTH absolute difference and relative
-    difference so it works for light pencil as well as dark pen.
+    This is intended to catch cases such as:
+        A = 0.08
+        B = 0.30
+        C = 0.09
+        D = 0.28
+    as MULTIPLE, while still selecting one answer when:
+        A = 0.08
+        B = 0.31
+        C = 0.09
+        D = 0.17
+    because B clearly dominates.
     """
     values = np.asarray(densities, dtype=np.float32)
+
     if len(values) < 2:
         return None, "unclear", 0.0
 
+    # --------------------------------------------------
+    # Rank strongest -> weakest
+    # --------------------------------------------------
     order = np.argsort(values)[::-1]
+
     top_index = int(order[0])
     second_index = int(order[1])
 
     top = float(values[top_index])
     second = float(values[second_index])
 
-    gap = max(0.0, top - second)
-    ratio = top / max(second, 0.020)
+    if len(values) >= 3:
+        third = float(values[int(order[2])])
+    else:
+        third = 0.0
 
-    # Difference relative to the winner. 0 = exact tie, 1 = second is nearly zero.
-    relative_gap = gap / max(top, 0.020)
+    # --------------------------------------------------
+    # Row statistics
+    # --------------------------------------------------
+    top_second_gap = max(0.0, top - second)
+    second_third_gap = max(0.0, second - third)
 
-    # Keep a true blank guard so normal paper / printed bubble rings do not
-    # generate a forced answer.
+    top_second_ratio = top / max(second, 0.020)
+    relative_top_gap = top_second_gap / max(top, 0.020)
+
+    # Median of the lower-scoring choices gives us a
+    # local "normal empty bubble" reference for this row.
+    if len(values) >= 3:
+        lower_values = values[order[2:]]
+        row_background = float(np.median(lower_values))
+    else:
+        row_background = min(top, second)
+
+    # --------------------------------------------------
+    # BLANK CHECK
+    # --------------------------------------------------
+    # Keep a conservative blank floor so printed outlines,
+    # shadows, and tiny camera noise do not create an answer.
     blank_threshold = 0.075 if answer_key_mode else 0.065
+
     if top < blank_threshold:
         return None, "blank", 0.0
 
-    # A second mark must contain enough actual ink before it can create a
-    # "multiple" result. This prevents two nearly-empty bubbles from looking
-    # like a double answer because of print/lighting noise.
-    second_has_ink = second >= (0.090 if answer_key_mode else 0.080)
+    # --------------------------------------------------
+    # Is each of the top two really ink?
+    # --------------------------------------------------
+    filled_floor = 0.095 if answer_key_mode else 0.085
 
-    # "Very close" means that the runner-up is almost as intense as the winner.
-    # We use two complementary tests:
-    #   1) very small absolute difference
-    #   2) runner-up is at least ~82% of winner
-    # Requiring actual ink in the second bubble avoids false multiple marks.
-    very_close = (
-        gap <= (0.030 if answer_key_mode else 0.027)
-        or relative_gap <= 0.18
-        or ratio <= 1.20
+    top_is_filled = (
+        top >= filled_floor
+        and top >= row_background + 0.025
     )
 
-    if second_has_ink and very_close:
-        # Tie confidence is intentionally low; UI will ask the teacher to review
-        # it as a multiple mark.
-        separation = np.clip(relative_gap / 0.18, 0.0, 1.0)
-        confidence = float(separation * 45.0)
+    second_is_filled = (
+        second >= filled_floor
+        and second >= row_background + 0.025
+    )
+
+    # --------------------------------------------------
+    # Are the strongest two close enough to represent
+    # two intentional marks?
+    # --------------------------------------------------
+    top_two_are_close = (
+        top_second_gap <= 0.045
+        or relative_top_gap <= 0.22
+        or top_second_ratio <= 1.28
+    )
+
+    # --------------------------------------------------
+    # Does the second mark stand out from all the rest?
+    #
+    # This is important. Two values can be "close" simply
+    # because every bubble is weak. We only want Multiple
+    # when the second bubble also looks like real ink.
+    # --------------------------------------------------
+    second_stands_out = (
+        second_third_gap >= 0.030
+        or second >= third * 1.25
+        or second >= row_background + 0.045
+    )
+
+    # Extra whole-row comparison:
+    # both top marks should be significantly stronger than
+    # the average of the remaining choices.
+    if len(values) >= 3:
+        rest_mean = float(np.mean(values[order[2:]]))
+    else:
+        rest_mean = 0.0
+
+    top_pair_dominates_rest = (
+        top >= rest_mean + 0.040
+        and second >= rest_mean + 0.035
+    )
+
+    # --------------------------------------------------
+    # MULTIPLE
+    # --------------------------------------------------
+    if (
+        top_is_filled
+        and second_is_filled
+        and top_two_are_close
+        and second_stands_out
+        and top_pair_dominates_rest
+    ):
+        # A high confidence here means we are confident that
+        # there are multiple real marks, not that one answer wins.
+        closeness = 1.0 - np.clip(relative_top_gap / 0.22, 0.0, 1.0)
+        separation = np.clip((second - rest_mean) / 0.18, 0.0, 1.0)
+
+        confidence = float(
+            np.clip(
+                (0.60 * closeness + 0.40 * separation) * 100.0,
+                55.0,
+                99.0,
+            )
+        )
+
         return None, "multiple", confidence
 
-    # Otherwise the strongest mark wins, including lighter marks that the old
-    # code called "unclear". Confidence reflects how strongly it dominates.
-    abs_score = np.clip(gap / 0.14, 0.0, 1.0)
-    rel_score = np.clip((relative_gap - 0.18) / 0.52, 0.0, 1.0)
-    ratio_score = np.clip((ratio - 1.20) / 1.20, 0.0, 1.0)
-    confidence = float((0.45 * abs_score + 0.35 * rel_score + 0.20 * ratio_score) * 100.0)
+    # --------------------------------------------------
+    # OTHERWISE THE STRONGEST BUBBLE WINS
+    # --------------------------------------------------
+    answer = str(choices[top_index])
 
-    # Do not let a mathematically decisive but light mark display as 0% confidence.
-    # The answer is still selected because its dominance is clear.
-    confidence = max(confidence, 35.0)
+    # Confidence is based on how strongly the winner beats
+    # the runner-up and the rest of the row.
+    gap_score = np.clip(top_second_gap / 0.15, 0.0, 1.0)
 
-    return str(choices[top_index]), "clear", confidence
+    relative_score = np.clip(
+        relative_top_gap / 0.50,
+        0.0,
+        1.0,
+    )
+
+    ratio_score = np.clip(
+        (top_second_ratio - 1.0) / 1.50,
+        0.0,
+        1.0,
+    )
+
+    rest_separation = np.clip(
+        (top - rest_mean) / 0.20,
+        0.0,
+        1.0,
+    )
+
+    confidence = float(
+        (
+            0.35 * gap_score
+            + 0.25 * relative_score
+            + 0.15 * ratio_score
+            + 0.25 * rest_separation
+        )
+        * 100.0
+    )
+
+    # If the winner is genuinely above the row's background,
+    # don't show an unnecessarily tiny confidence number.
+    if top_is_filled:
+        confidence = max(confidence, 40.0)
+
+    return answer, "clear", confidence
 
 def _robust_empty_baseline(all_density_rows: Sequence[Sequence[float]]) -> tuple[float, float]:
     """
