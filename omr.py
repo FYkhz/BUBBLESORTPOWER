@@ -207,24 +207,90 @@ def align_sheet(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str | None]:
 
 
 def _prepare_gray(aligned_bgr: np.ndarray) -> np.ndarray:
+    """
+    Strong paper/background normalization.
+
+    Goal:
+      - white paper stays white
+      - gray paper is pushed toward white
+      - slow shadows / camera exposure gradients are removed
+      - pencil/ink remains dark
+
+    This is intentionally illumination-invariant because OMR should care
+    about ink relative to the nearby paper, not the absolute page brightness.
+    """
     gray = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2GRAY)
-    # Remove remaining slow illumination gradients without erasing pencil/ink.
-    bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=35, sigmaY=35)
+
+    # Mild denoise first so the background estimate is not affected by sensor noise.
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Estimate the slowly-changing paper background.
+    # The kernel is much larger than a bubble, so ink/printed marks do not
+    # become part of the background model.
+    bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=48, sigmaY=48)
+
+    # Division normalization removes multiplicative lighting variation:
+    # a gray/shadowed area becomes comparable to a white area.
     flat = cv2.divide(gray, np.maximum(bg, 1), scale=255)
-    return cv2.bilateralFilter(flat, 5, 22, 22)
+
+    # Robust percentile stretch. Avoid min/max because one black mark can
+    # otherwise distort the entire sheet.
+    lo = float(np.percentile(flat, 1.5))
+    hi = float(np.percentile(flat, 98.5))
+
+    if hi - lo >= 10.0:
+        flat = np.clip((flat.astype(np.float32) - lo) * 255.0 / (hi - lo), 0, 255)
+        flat = flat.astype(np.uint8)
+    else:
+        flat = flat.astype(np.uint8)
+
+    # Gentle local contrast improves pencil without making gray paper "ink".
+    clahe = cv2.createCLAHE(clipLimit=1.35, tileGridSize=(12, 12))
+    flat = clahe.apply(flat)
+
+    # Final edge-preserving smoothing.
+    flat = cv2.bilateralFilter(flat, 5, 24, 24)
+
+    return flat
 
 
 def _prepare_threshold(aligned_bgr: np.ndarray) -> np.ndarray:
+    """
+    Threshold after background normalization.
+
+    Two adaptive views are combined so light pencil survives while broad gray
+    background regions do not become foreground.
+    """
     gray = _prepare_gray(aligned_bgr)
-    threshold = cv2.adaptiveThreshold(
+
+    adaptive_gauss = cv2.adaptiveThreshold(
         gray,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        41,
-        11,
+        45,
+        10,
     )
-    threshold = cv2.morphologyEx(threshold, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+    adaptive_mean = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        45,
+        12,
+    )
+
+    # Require support from at least one adaptive method, but clean isolated noise.
+    threshold = cv2.bitwise_or(adaptive_gauss, adaptive_mean)
+
+    threshold = cv2.morphologyEx(
+        threshold,
+        cv2.MORPH_OPEN,
+        np.ones((2, 2), np.uint8),
+        iterations=1,
+    )
+
     return threshold
 
 
@@ -358,41 +424,137 @@ def _density_for_circle(
     center: tuple[int, int],
     radius: int = INNER_RADIUS,
 ) -> float:
-    """Multi-signal fill score. Printed outlines are mostly outside the inner mask."""
+    """
+    Illumination-invariant bubble fill score.
+
+    Instead of asking:
+        "How dark is this bubble absolutely?"
+
+    we ask:
+        "How much darker is this bubble than the paper immediately around it?"
+
+    This makes gray paper, shadows, and exposure changes much less important.
+    """
     cx, cy = center
     h, w = gray.shape
-    if not (radius + 3 <= cx < w - radius - 3 and radius + 3 <= cy < h - radius - 3):
+
+    outer_radius = max(40, radius + 18)
+
+    if not (
+        outer_radius + 2 <= cx < w - outer_radius - 2
+        and outer_radius + 2 <= cy < h - outer_radius - 2
+    ):
         return 0.0
 
-    y0, y1 = cy - radius, cy + radius + 1
-    x0, x1 = cx - radius, cx + radius + 1
-    local_gray = gray[y0:y1, x0:x1]
-    local_thr = threshold[y0:y1, x0:x1]
-    yy, xx = np.ogrid[-radius:radius + 1, -radius:radius + 1]
-    mask = (xx * xx + yy * yy) <= radius * radius
-    if not np.any(mask):
+    # --------------------------------------------------------------
+    # Extract a local patch around the entire bubble.
+    # --------------------------------------------------------------
+    y0, y1 = cy - outer_radius, cy + outer_radius + 1
+    x0, x1 = cx - outer_radius, cx + outer_radius + 1
+
+    patch_gray = gray[y0:y1, x0:x1]
+    patch_thr = threshold[y0:y1, x0:x1]
+
+    yy, xx = np.ogrid[
+        -outer_radius:outer_radius + 1,
+        -outer_radius:outer_radius + 1,
+    ]
+
+    rr2 = xx * xx + yy * yy
+
+    # Use a smaller inner region so the printed bubble outline contributes less.
+    inner_radius = max(5, int(round(radius * 0.78)))
+    inner_mask = rr2 <= inner_radius * inner_radius
+
+    # Paper reference ring outside the printed bubble.
+    annulus_inner = max(radius + 8, int(round(radius * 1.35)))
+    annulus_outer = outer_radius - 2
+    bg_mask = (
+        (rr2 >= annulus_inner * annulus_inner)
+        & (rr2 <= annulus_outer * annulus_outer)
+    )
+
+    if not np.any(inner_mask) or not np.any(bg_mask):
         return 0.0
 
-    binary_density = float(np.mean(local_thr[mask] > 0))
-    darkness = float(np.mean((255.0 - local_gray[mask]) / 255.0))
+    inner_gray = patch_gray[inner_mask].astype(np.float32)
+    bg_gray = patch_gray[bg_mask].astype(np.float32)
 
-    # A fixed dark-pixel view helps with dense black/blue ink after normalization.
-    fixed_density = float(np.mean(local_gray[mask] < 178))
+    # --------------------------------------------------------------
+    # Robust local paper statistics.
+    # Median is safer than mean when handwriting or a line crosses nearby.
+    # --------------------------------------------------------------
+    bg_median = float(np.median(bg_gray))
+    bg_mad = float(np.median(np.abs(bg_gray - bg_median)))
+    bg_sigma = max(3.0, 1.4826 * bg_mad)
 
-    # Local paper reference: compare the bubble center to an annulus around it.
-    outer = 38
-    oy0, oy1 = max(0, cy - outer), min(h, cy + outer + 1)
-    ox0, ox1 = max(0, cx - outer), min(w, cx + outer + 1)
-    patch = gray[oy0:oy1, ox0:ox1]
-    pyy, pxx = np.ogrid[oy0 - cy:oy1 - cy, ox0 - cx:ox1 - cx]
-    rr2 = pxx * pxx + pyy * pyy
-    annulus = (rr2 >= 31 * 31) & (rr2 <= 38 * 38)
-    bg_mean = float(np.mean(patch[annulus])) if np.any(annulus) else 245.0
-    inner_mean = float(np.mean(local_gray[mask]))
-    contrast = float(np.clip((bg_mean - inner_mean) / 150.0, 0.0, 1.0))
+    inner_mean = float(np.mean(inner_gray))
+    inner_median = float(np.median(inner_gray))
 
-    return float(np.clip(0.45 * binary_density + 0.20 * darkness + 0.20 * fixed_density + 0.15 * contrast, 0.0, 1.0))
+    # --------------------------------------------------------------
+    # Signal 1: local contrast relative to nearby paper.
+    # --------------------------------------------------------------
+    contrast_mean = max(0.0, bg_median - inner_mean)
+    contrast_median = max(0.0, bg_median - inner_median)
 
+    contrast_score = float(
+        np.clip(
+            (0.65 * contrast_mean + 0.35 * contrast_median) / 95.0,
+            0.0,
+            1.0,
+        )
+    )
+
+    # --------------------------------------------------------------
+    # Signal 2: locally dark pixels.
+    #
+    # Threshold is RELATIVE to the surrounding paper, not a fixed gray value.
+    # On gray paper, this threshold shifts automatically.
+    # --------------------------------------------------------------
+    local_dark_cut = bg_median - max(12.0, 2.2 * bg_sigma)
+    local_dark_density = float(np.mean(inner_gray <= local_dark_cut))
+
+    # --------------------------------------------------------------
+    # Signal 3: adaptive binary mask density.
+    # --------------------------------------------------------------
+    binary_density = float(np.mean(patch_thr[inner_mask] > 0))
+
+    # --------------------------------------------------------------
+    # Signal 4: center-core darkness.
+    #
+    # Useful for solid fills; keeps the printed ring from dominating.
+    # --------------------------------------------------------------
+    core_radius = max(4, int(round(radius * 0.48)))
+    core_mask = rr2 <= core_radius * core_radius
+    core_gray = patch_gray[core_mask].astype(np.float32)
+
+    core_mean = float(np.mean(core_gray))
+    core_contrast = max(0.0, bg_median - core_mean)
+    core_score = float(np.clip(core_contrast / 90.0, 0.0, 1.0))
+
+    # --------------------------------------------------------------
+    # Signal 5: background-normalized darkness.
+    #
+    # This ratio is stable even when the page is globally gray.
+    # --------------------------------------------------------------
+    normalized_darkness = float(
+        np.clip(
+            (bg_median - inner_mean) / max(bg_median, 35.0),
+            0.0,
+            1.0,
+        )
+    )
+
+    # Weighted ensemble.
+    score = (
+        0.28 * binary_density
+        + 0.27 * local_dark_density
+        + 0.22 * contrast_score
+        + 0.15 * core_score
+        + 0.08 * normalized_darkness
+    )
+
+    return float(np.clip(score, 0.0, 1.0))
 
 
 def _robust_empty_baseline(
@@ -875,6 +1037,20 @@ def scan_sheet(
     rows_to_use = refined_rows if grid_used else expected_rows
 
     blur = _blur_score(aligned)
+
+    # Background diagnostics after normalization. A gray original is okay;
+    # what matters is whether normalization produced a stable paper field.
+    paper_level = float(np.percentile(gray, 75))
+    paper_low = float(np.percentile(gray, 20))
+    paper_spread = paper_level - paper_low
+
+    if paper_level < 175:
+        bg_warning = (
+            "The page background is unusually dark. The scanner normalized it, "
+            "but brighter/even lighting may improve reliability."
+        )
+        warning = (warning + " " + bg_warning) if warning else bg_warning
+
     if blur < 38.0:
         blur_warning = "The image is quite blurry; answer confidence may be reduced. Retake the photo if possible."
         warning = (warning + " " + blur_warning) if warning else blur_warning
